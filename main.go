@@ -195,12 +195,6 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		req.Header.Set("X-Forwarded-For", clientIPFromRequest(r))
 	}
 
-	// Let Caddy capture errors from the proxy.
-	rp.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		// Convert to Caddy error for consistent logging
-		_ = caddyhttp.ErrorHandler(caddyhttp.Error(http.StatusBadGateway, err)).ServeHTTP(rw, req, nil)
-	}
-
 	rp.ServeHTTP(w, r)
 	return nil
 }
