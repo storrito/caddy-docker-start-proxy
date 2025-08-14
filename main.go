@@ -19,10 +19,24 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
+	httpcaddyfile "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 )
 
 func init() {
 	caddy.RegisterModule(Handler{})
+
+	// Register the Caddyfile directive "docker_start_proxy"
+    httpcaddyfile.RegisterHandlerDirective("docker_start_proxy", parseDockerStartProxy)
+}
+
+// parseDockerStartProxy lets the directive be used in Caddyfile.
+// It simply reuses your UnmarshalCaddyfile implementation.
+func parseDockerStartProxy(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+    var m Handler
+    if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+        return nil, err
+    }
+    return m, nil
 }
 
 // Handler is a Caddy HTTP middleware that ensures the derived Docker container
