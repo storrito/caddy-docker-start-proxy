@@ -114,37 +114,27 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		for d.NextBlock(0) {
 			switch d.Val() {
 			case "health_path":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.HealthPath = d.Arg()
+				if !d.NextArg() { return d.ArgErr() }
+				h.HealthPath = d.Val()
+
 			case "timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Arg())
-				if err != nil {
-					return d.Errf("invalid timeout: %v", err)
-				}
+				if !d.NextArg() { return d.ArgErr() }
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil { return d.Errf("invalid timeout: %v", err) }
 				h.Timeout = caddy.Duration(dur)
+
 			case "poll_interval":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Arg())
-				if err != nil {
-					return d.Errf("invalid poll_interval: %v", err)
-				}
+				if !d.NextArg() { return d.ArgErr() }
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil { return d.Errf("invalid poll_interval: %v", err) }
 				h.PollInterval = caddy.Duration(dur)
+
 			case "probe_dial_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Arg())
-				if err != nil {
-					return d.Errf("invalid probe_dial_timeout: %v", err)
-				}
+				if !d.NextArg() { return d.ArgErr() }
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil { return d.Errf("invalid probe_dial_timeout: %v", err) }
 				h.ProbeDialTimeout = caddy.Duration(dur)
+
 			default:
 				return d.Errf("unrecognized subdirective: %s", d.Val())
 			}
@@ -152,6 +142,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	}
 	return nil
 }
+
 
 // ServeHTTP implements the middleware logic.
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
