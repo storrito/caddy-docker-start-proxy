@@ -9,6 +9,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,12 +56,18 @@ type Handler struct {
 	// Dial timeout for health probe HTTP client. Defaults to 3s.
 	ProbeDialTimeout caddy.Duration `json:"probe_dial_timeout,omitempty"`
 
+	RedirectURL   string `json:"redirect_url,omitempty"`   // e.g. "https://storrito.localhost/signup"
+	RedirectCode  int    `json:"redirect_code,omitempty"`  // 301, 302, 303, 307, or 308 (default 307)
+
 	// Internal: Docker client
 	docker *client.Client
 
 	// Internal: HTTP client for health checks
 	probeClient *http.Client
 }
+
+// ErrContainerNotFound is returned when the Docker container for a request is missing.
+var ErrContainerNotFound = errors.New("container not found")
 
 var (
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
@@ -89,6 +96,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	if h.ProbeDialTimeout <= 0 {
 		h.ProbeDialTimeout = caddy.Duration(3 * time.Second)
+	}
+
+	// Default redirect code if not specified
+	if h.RedirectCode == 0 {
+		h.RedirectCode = http.StatusTemporaryRedirect // 307
 	}
 
 	cli, err := client.NewClientWithOpts(
@@ -122,6 +134,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 //   timeout 30s
 //   poll_interval 300ms
 //   probe_dial_timeout 3s
+//   redirect_url https://example.com/fallback
+//   redirect_code 307
 // }
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -148,6 +162,23 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				dur, err := caddy.ParseDuration(d.Val())
 				if err != nil { return d.Errf("invalid probe_dial_timeout: %v", err) }
 				h.ProbeDialTimeout = caddy.Duration(dur)
+
+			case "redirect_url":
+				if !d.NextArg() { return d.ArgErr() }
+				h.RedirectURL = d.Val()
+
+			case "redirect_code":
+				if !d.NextArg() { return d.ArgErr() }
+				codeStr := d.Val()
+				code, err := strconv.Atoi(codeStr)
+				if err != nil { return d.Errf("invalid redirect_code: %v", err) }
+				switch code {
+				case 301, 302, 303, 307, 308:
+					// ok
+				default:
+					return d.Errf("redirect_code must be one of 301, 302, 303, 307, 308; got %d", code)
+				}
+				h.RedirectCode = code
 
 			default:
 				return d.Errf("unrecognized subdirective: %s", d.Val())
@@ -184,6 +215,14 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 
 	// Ensure container is running (start if needed).
 	if err := h.ensureRunning(ctx, containerName); err != nil {
+		if errors.Is(err, ErrContainerNotFound) && h.RedirectURL != "" {
+			code := h.RedirectCode
+			if code == 0 {
+				code = http.StatusTemporaryRedirect
+			}
+			http.Redirect(w, r, h.RedirectURL, code)
+			return nil
+		}
 		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("container %s not ready: %w", containerName, err))
 	}
 
@@ -225,7 +264,7 @@ func (h Handler) ensureRunning(ctx context.Context, name string) error {
 		return fmt.Errorf("list containers: %w", err)
 	}
 	if len(containers) == 0 {
-		return fmt.Errorf("container %q not found", name)
+		return fmt.Errorf("%w: %q", ErrContainerNotFound, name)
 	}
 
 	// If not running, start it.
