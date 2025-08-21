@@ -9,7 +9,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,53 +16,44 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 
+	httpcaddyfile "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
-	httpcaddyfile "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 )
 
 func init() {
 	caddy.RegisterModule(Handler{})
 
 	// Register the Caddyfile directive "docker_start_proxy"
-    httpcaddyfile.RegisterHandlerDirective("docker_start_proxy", parseDockerStartProxy)
+	httpcaddyfile.RegisterHandlerDirective("docker_start_proxy", parseDockerStartProxy)
 }
 
 // parseDockerStartProxy lets the directive be used in Caddyfile.
 // It simply reuses your UnmarshalCaddyfile implementation.
 func parseDockerStartProxy(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-    var m Handler
-    if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
-        return nil, err
-    }
-    return m, nil
+	var m Handler
+	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // Handler is a Caddy HTTP middleware that ensures the derived Docker container
 // is running and healthy before proxying the request to it.
 type Handler struct {
-	// Path used for health probing. Defaults to "/health".
-	HealthPath string `json:"health_path,omitempty"`
-
-	// Max time to start (or find) the container and pass health checks.
-	// Defaults to 30s.
-	Timeout caddy.Duration `json:"timeout,omitempty"`
-
-	// Interval between health probes. Defaults to 300ms.
-	PollInterval caddy.Duration `json:"poll_interval,omitempty"`
-
-	// Dial timeout for health probe HTTP client. Defaults to 3s.
-	ProbeDialTimeout caddy.Duration `json:"probe_dial_timeout,omitempty"`
-
-	RedirectURL   string `json:"redirect_url,omitempty"`   // e.g. "https://storrito.localhost/signup"
-	RedirectCode  int    `json:"redirect_code,omitempty"`  // 301, 302, 303, 307, or 308 (default 307)
+	// Only configurable parameter kept minimal
+	RedirectURL string `json:"redirect_url,omitempty"` // e.g. "https://storrito.localhost/signup"
 
 	// Internal: Docker client
 	docker *client.Client
 
-	// Internal: HTTP client for health checks
-	probeClient *http.Client
+	// Internal: HTTP client for health checks and hard-coded timings
+	probeClient      *http.Client
+	healthPath       string
+	timeout          time.Duration
+	pollInterval     time.Duration
+	probeDialTimeout time.Duration
 }
 
 // ErrContainerNotFound is returned when the Docker container for a request is missing.
@@ -85,23 +75,11 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision initializes defaults and the Docker client.
 func (h *Handler) Provision(ctx caddy.Context) error {
-	if h.HealthPath == "" {
-		h.HealthPath = "/health"
-	}
-	if h.Timeout <= 0 {
-		h.Timeout = caddy.Duration(30 * time.Second)
-	}
-	if h.PollInterval <= 0 {
-		h.PollInterval = caddy.Duration(300 * time.Millisecond)
-	}
-	if h.ProbeDialTimeout <= 0 {
-		h.ProbeDialTimeout = caddy.Duration(3 * time.Second)
-	}
-
-	// Default redirect code if not specified
-	if h.RedirectCode == 0 {
-		h.RedirectCode = http.StatusTemporaryRedirect // 307
-	}
+	// Hard-coded minimal defaults
+	h.healthPath = "/health"
+	h.timeout = 30 * time.Second
+	h.pollInterval = 300 * time.Millisecond
+	h.probeDialTimeout = 3 * time.Second
 
 	cli, err := client.NewClientWithOpts(
 		client.FromEnv, // honor DOCKER_HOST/DOCKER_TLS_VERIFY/DOCKER_CERT_PATH
@@ -116,7 +94,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		Transport: &http.Transport{
 			// Use default transport but tighten dial timeout.
 			DialContext: (&net.Dialer{
-				Timeout: time.Duration(h.ProbeDialTimeout),
+				Timeout: h.probeDialTimeout,
 			}).DialContext,
 			// Keep defaults for TLS/HTTP2 off since we talk to upstream via HTTP in-cluster.
 			DisableKeepAlives: false,
@@ -127,58 +105,20 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// UnmarshalCaddyfile supports a simple Caddyfile block:
+// UnmarshalCaddyfile supports a minimal Caddyfile block:
 //
-// docker_start_proxy {
-//   health_path /health
-//   timeout 30s
-//   poll_interval 300ms
-//   probe_dial_timeout 3s
-//   redirect_url https://example.com/fallback
-//   redirect_code 307
-// }
+//	docker_start_proxy {
+//	  redirect_url https://example.com/fallback
+//	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
-			case "health_path":
-				if !d.NextArg() { return d.ArgErr() }
-				h.HealthPath = d.Val()
-
-			case "timeout":
-				if !d.NextArg() { return d.ArgErr() }
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil { return d.Errf("invalid timeout: %v", err) }
-				h.Timeout = caddy.Duration(dur)
-
-			case "poll_interval":
-				if !d.NextArg() { return d.ArgErr() }
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil { return d.Errf("invalid poll_interval: %v", err) }
-				h.PollInterval = caddy.Duration(dur)
-
-			case "probe_dial_timeout":
-				if !d.NextArg() { return d.ArgErr() }
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil { return d.Errf("invalid probe_dial_timeout: %v", err) }
-				h.ProbeDialTimeout = caddy.Duration(dur)
-
 			case "redirect_url":
-				if !d.NextArg() { return d.ArgErr() }
-				h.RedirectURL = d.Val()
-
-			case "redirect_code":
-				if !d.NextArg() { return d.ArgErr() }
-				codeStr := d.Val()
-				code, err := strconv.Atoi(codeStr)
-				if err != nil { return d.Errf("invalid redirect_code: %v", err) }
-				switch code {
-				case 301, 302, 303, 307, 308:
-					// ok
-				default:
-					return d.Errf("redirect_code must be one of 301, 302, 303, 307, 308; got %d", code)
+				if !d.NextArg() {
+					return d.ArgErr()
 				}
-				h.RedirectCode = code
+				h.RedirectURL = d.Val()
 
 			default:
 				return d.Errf("unrecognized subdirective: %s", d.Val())
@@ -187,7 +127,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	}
 	return nil
 }
-
 
 // ServeHTTP implements the middleware logic.
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -210,24 +149,20 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	upstreamHost := containerName
 	upstreamURL := fmt.Sprintf("http://%s:8080", upstreamHost)
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(h.Timeout))
+	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 
 	// Ensure container is running (start if needed).
 	if err := h.ensureRunning(ctx, containerName); err != nil {
 		if errors.Is(err, ErrContainerNotFound) && h.RedirectURL != "" {
-			code := h.RedirectCode
-			if code == 0 {
-				code = http.StatusTemporaryRedirect
-			}
-			http.Redirect(w, r, h.RedirectURL, code)
+			http.Redirect(w, r, h.RedirectURL, http.StatusTemporaryRedirect)
 			return nil
 		}
 		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("container %s not ready: %w", containerName, err))
 	}
 
 	// Wait for health readiness.
-	if err := h.waitHealthy(ctx, upstreamURL+h.HealthPath); err != nil {
+	if err := h.waitHealthy(ctx, upstreamURL+h.healthPath); err != nil {
 		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("container %s not healthy: %w", containerName, err))
 	}
 
@@ -278,7 +213,7 @@ func (h Handler) ensureRunning(ctx context.Context, name string) error {
 }
 
 func (h Handler) waitHealthy(ctx context.Context, healthURL string) error {
-	t := time.NewTicker(time.Duration(h.PollInterval))
+	t := time.NewTicker(h.pollInterval)
 	defer t.Stop()
 
 	for {
