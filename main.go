@@ -6,15 +6,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 
 	httpcaddyfile "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/docker/docker/api/types/container"
@@ -36,7 +35,7 @@ func parseDockerStartProxy(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler,
 	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
 		return nil, err
 	}
-	return m, nil
+	return &m, nil
 }
 
 // Handler is a Caddy HTTP middleware that ensures the derived Docker container
@@ -54,6 +53,10 @@ type Handler struct {
 	timeout          time.Duration
 	pollInterval     time.Duration
 	probeDialTimeout time.Duration
+
+	// Internal: proxy cache and caddy context for provisioning reverse proxies
+	proxyMap sync.Map
+	caddyCtx caddy.Context
 }
 
 // ErrContainerNotFound is returned when the Docker container for a request is missing.
@@ -80,6 +83,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.timeout = 30 * time.Second
 	h.pollInterval = 300 * time.Millisecond
 	h.probeDialTimeout = 3 * time.Second
+	// Save caddy context for provisioning sub-handlers
+	h.caddyCtx = ctx
 
 	cli, err := client.NewClientWithOpts(
 		client.FromEnv, // honor DOCKER_HOST/DOCKER_TLS_VERIFY/DOCKER_CERT_PATH
@@ -129,7 +134,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // ServeHTTP implements the middleware logic.
-func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	host := r.Host
 	if host == "" {
 		return caddyhttp.Error(http.StatusBadRequest, errors.New("missing Host header"))
@@ -166,28 +171,34 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("container %s not healthy: %w", containerName, err))
 	}
 
-	// Reverse proxy to upstream.
-	target, _ := url.Parse(upstreamURL)
-	rp := httputil.NewSingleHostReverseProxy(target)
-
-	// Preserve original Host header for app logic while still routing to upstream.
-	origDirector := rp.Director
-	rp.Director = func(req *http.Request) {
-		origDirector(req)
-		// Keep incoming Host header (so app sees foo.example.com)
-		req.Host = r.Host
-		// You may want to forward X-Forwarded-*; Caddy usually sets these,
-		// but since we bypass caddyhttp/reverseproxy, set the essentials:
-		req.Header.Set("X-Forwarded-Host", r.Host)
-		req.Header.Set("X-Forwarded-Proto", schemeFromRequest(r))
-		req.Header.Set("X-Forwarded-For", clientIPFromRequest(r))
+	// Reverse proxy to upstream using a cached, provisioned reverseproxy handler.
+	dial := upstreamHost + ":8080"
+	rp, err := h.getOrCreateProxy(dial)
+	if err != nil {
+		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("proxy init failed for %s: %w", dial, err))
 	}
-
-	rp.ServeHTTP(w, r)
-	return nil
+	return rp.ServeHTTP(w, r, next)
 }
 
-func (h Handler) ensureRunning(ctx context.Context, name string) error {
+func (h *Handler) getOrCreateProxy(dial string) (*reverseproxy.Handler, error) {
+	if v, ok := h.proxyMap.Load(dial); ok {
+		return v.(*reverseproxy.Handler), nil
+	}
+	rp := &reverseproxy.Handler{
+		Upstreams: []*reverseproxy.Upstream{{Dial: dial}},
+	}
+	if err := rp.Provision(h.caddyCtx); err != nil {
+		return nil, err
+	}
+	if actual, loaded := h.proxyMap.LoadOrStore(dial, rp); loaded {
+		// Another goroutine installed a proxy; cleanup ours and use the existing one.
+		rp.Cleanup()
+		return actual.(*reverseproxy.Handler), nil
+	}
+	return rp, nil
+}
+
+func (h *Handler) ensureRunning(ctx context.Context, name string) error {
 	// Find container by name (exact match)
 	args := filters.NewArgs()
 	args.Add("name", "^"+name+"$") // Docker regex anchors
@@ -212,7 +223,7 @@ func (h Handler) ensureRunning(ctx context.Context, name string) error {
 	return nil
 }
 
-func (h Handler) waitHealthy(ctx context.Context, healthURL string) error {
+func (h *Handler) waitHealthy(ctx context.Context, healthURL string) error {
 	t := time.NewTicker(h.pollInterval)
 	defer t.Stop()
 
@@ -245,36 +256,6 @@ func leftmostLabel(host string) string {
 		return ""
 	}
 	return parts[0]
-}
-
-func schemeFromRequest(r *http.Request) string {
-	if r.Header.Get("X-Forwarded-Proto") != "" {
-		return r.Header.Get("X-Forwarded-Proto")
-	}
-	if r.TLS != nil {
-		return "https"
-	}
-	if r.URL != nil && r.URL.Scheme != "" {
-		return r.URL.Scheme
-	}
-	// Caddy sits in front; default to https if original was TLS-terminated at Caddy
-	if strings.EqualFold(os.Getenv("CADDY_TERMINATES_TLS"), "true") {
-		return "https"
-	}
-	return "http"
-}
-
-func clientIPFromRequest(r *http.Request) string {
-	// Trust prior XFF if already present; append current remote addr else.
-	xff := r.Header.Get("X-Forwarded-For")
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	if xff == "" {
-		return host
-	}
-	return xff + ", " + host
 }
 
 func respStatusMaybe(resp *http.Response) any {
